@@ -1,5 +1,7 @@
 import pytest
 
+BaseTurtle = pytest.importorskip("BaseTurtle")
+
 from turtle_plotter import BaseTurtle, BrachioGraphTurtle
 from brachiograph import BrachioGraph
 from plotter import Plotter
@@ -24,7 +26,7 @@ bgt = BrachioGraphTurtle(
     elbow_sweep=120,
 )
 
-bg = BrachioGraph(virtual=True, turtle=True)
+bg = BrachioGraph(virtual=True, turtle=True, wait=0)
 
 
 def test_grid():

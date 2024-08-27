@@ -1,29 +1,23 @@
 .. _virtual-mode:
 
-How to run a virtual BrachioGraph in software
+How to run a virtual plotter in software
 =============================================
 
-..  seealso:: :ref:`use-turtle`
+In virtual mode, a :class:`~plotter.Plotter` behaves as though it had hardware attached,
+but doesn't actually attempt to set pulse-widths on the servo motors.  
 
-Sometimes, you might want to run the BrachioGraph class and its methods without actually plotting anything. For
-example, you might:
+If a :class:`~plotter.Plotter` is unable to connect to ``pigpiod`` to communicate with the hardware,
+it will revert to virtual mode automatically.
 
-* not have the hardware connected
-* not be running it on a Raspberry Pi
-* want to run some tests using a 'virtual' plotter
-
-*Virtual mode* makes this possible.
-
-To invoke virtual mode, instantiate your ``BrachioGraph`` with the ``virtual`` argument:
+It's also possible to force a plotter to run in virtual mode, by instantiating it with the 
+``virtual`` argument, for example:
 
 .. code-block:: python
-    :emphasize-lines: 3
 
-    bg = BrachioGraph(
-       [...]
-       virtual=True,
-       [...]
-       )
+    bg = BrachioGraph(virtual=True)
 
-Virtual mode will also be set automatically if the ``BrachioGraph`` module runs into an ``ImportError`` when trying
-to load the ``pigpio`` library.
+Whether or not the plotter runs in virtual mode, it's also possible to use Python's turtle graphics to 
+run a graphical turtle on-screen to represent the physical behaviour, with the ``turtle`` argument::
+
+    bg = BrachioGraph(turtle=True)
+

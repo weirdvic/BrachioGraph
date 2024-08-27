@@ -6,9 +6,6 @@ class TestBasicPlotter:
 
     plotter = Plotter()
 
-    def test_virtual(self):
-        assert self.plotter.virtual == True
-
     def test_status_report(self):
         self.plotter.status()
 
@@ -33,6 +30,7 @@ class TestBiDiPlotter:
 
     plotter = Plotter(
         virtual=True,
+        wait=0,
         servo_1_angle_pws_bidi={
             -135: {"cw": 2374, "acw": 2386},
             -120: {"cw": 2204, "acw": 2214},

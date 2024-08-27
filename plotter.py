@@ -1,13 +1,13 @@
 """Contains a base class for a drawing robot."""
 
-from time import sleep
+from time import sleep, monotonic
 import json
+import pprint
 import math
 import readchar
 import tqdm
 import pigpio
 import numpy
-from turtle_plotter import BaseTurtle
 
 
 class Plotter:
@@ -35,20 +35,29 @@ class Plotter:
         servo_1_angle_pws_bidi: tuple = (),  # bi-directional pulse-widths for various angles
         servo_2_angle_pws_bidi: tuple = (),
         #  ----------------- the pen -----------------
-        pw_up: int = 1500,  # pulse-widths for pen up/down
-        pw_down: int = 1100,
+        pw_up: int = None,  # pulse-widths for pen up/down
+        pw_down: int = None,
         #  ----------------- physical control -----------------
+        angular_step: float = None,  # default step of the servos in degrees
         wait: float = None,  # default wait time between operations
         resolution: float = None,  # default resolution of the plotter in cm
     ):
 
+        self.last_moved = monotonic()
         self.virtual = virtual
         self.angle_1 = servo_1_parked_angle
         self.angle_2 = servo_2_parked_angle
 
         if turtle:
-            self.setup_turtle(turtle_coarseness)
-            self.turtle.showturtle()
+            try:
+                from turtle import Turtle, Screen
+
+                self.setup_turtle(turtle_coarseness)
+                self.turtle.showturtle()
+
+            except ModuleNotFoundError:
+                self.turtle = False
+                print("Turtle mode unavailable")
         else:
             self.turtle = False
 
@@ -64,6 +73,7 @@ class Plotter:
         self.hysteresis_correction_1 = hysteresis_correction_1
 
         if servo_1_angle_pws_bidi:
+            # use the bi-directional values to obtain mean values, and a hysteresis correction value
             servo_1_angle_pws = []
             differences = []
             for angle, pws in servo_1_angle_pws_bidi.items():
@@ -87,6 +97,7 @@ class Plotter:
         self.hysteresis_correction_2 = hysteresis_correction_2
 
         if servo_2_angle_pws_bidi:
+            # use the bi-directional values to obtain mean values, and a hysteresis correction value
             servo_2_angle_pws = []
             differences = []
             for angle, pws in servo_2_angle_pws_bidi.items():
@@ -124,21 +135,25 @@ class Plotter:
                 self.rpi.set_PWM_frequency(15, 50)
                 pigpio.exceptions = True
                 self.virtual = False
-                # by default we use a wait factor of 0.1 for accuracy
-                self.wait = wait if wait is not None else 0.1
+                # by default we use a wait factor of 0.01 seconds for better control
+                self.wait = wait if wait is not None else 0.01
 
             except AttributeError:
                 print("pigpio daemon is not available; running in virtual mode")
                 self.virtualise()
-                self.virtual = True
                 self.wait = wait if wait is not None else 0
 
         # create the pen object
+        pw_up = pw_up or 1400
+        pw_down = pw_down or 1600
+
         self.pen = Pen(bg=self, pw_up=pw_up, pw_down=pw_down, virtual=self.virtual)
 
-        self.resolution = resolution or 1
+        self.angular_step = angular_step or 0.1
+        self.resolution = resolution or 0.1
 
         self.set_angles(self.servo_1_parked_angle, self.servo_2_parked_angle)
+        sleep(1)
 
         self.status()
 
@@ -148,12 +163,13 @@ class Plotter:
 
         self.virtual_pw_1 = self.angles_to_pw_1(-90)
         self.virtual_pw_2 = self.angles_to_pw_2(90)
-
-        # by default in virtual mode, we use a wait factor of 0 for speed
         self.virtual = True
 
     def setup_turtle(self, coarseness):
         """Initialises a Python turtle based on this plotter."""
+
+        from turtle_plotter import BaseTurtle
+
         self.turtle = BaseTurtle(
             window_size=850,  # width and height of the turtle canvas
             speed=10,  # how fast to draw
@@ -166,7 +182,7 @@ class Plotter:
 
     #  ----------------- plotting methods -----------------
 
-    def plot_file(self, filename="", wait=None, resolution=None, bounds=None):
+    def plot_file(self, filename="", bounds=None, angular_step=None, wait=None, resolution=None):
         """Plots and image encoded as JSON lines in ``filename``. Passes the lines in the supplied
         JSON file to ``plot_lines()``.
         """
@@ -176,18 +192,17 @@ class Plotter:
         with open(filename, "r") as line_file:
             lines = json.load(line_file)
 
-        self.plot_lines(
-            lines=lines, wait=wait, resolution=resolution, bounds=bounds, flip=True
-        )
+        self.plot_lines(lines, bounds, angular_step, wait, resolution, flip=True)
 
     def plot_lines(
         self,
         lines=[],
+        bounds=None,
+        angular_step=None,
         wait=None,
         resolution=None,
-        rotate=False,
         flip=False,
-        bounds=None,
+        rotate=False,
     ):
         """Passes each segment of each line in lines to ``draw_line()``"""
 
@@ -200,17 +215,19 @@ class Plotter:
 
             # only if we are not within 1mm of the start of the line, lift pen and go there
             if (round(self.x, 1), round(self.y, 1)) != (round(x, 1), round(y, 1)):
-                self.xy(x, y, wait=wait, resolution=resolution)
+                self.xy(x, y, angular_step, wait, resolution)
 
             for point in line[1:]:
                 x, y = point
-                self.xy(x, y, wait=wait, resolution=resolution, draw=True)
+                self.xy(x, y, angular_step, wait, resolution, draw=True)
 
         self.park()
 
-    #  ----------------- x/y drawing methods -----------------
+    #  ----------------- pattern-drawing methods -----------------
 
-    def box(self, bounds=None, wait=None, resolution=None, repeat=1, reverse=False):
+    def box(
+        self, bounds=None, angular_step=None, wait=None, resolution=None, repeat=1, reverse=False
+    ):
         """Draw a box marked out by the ``bounds``."""
 
         bounds = bounds or self.bounds
@@ -218,30 +235,31 @@ class Plotter:
         if not bounds:
             return "Box drawing is only possible when the bounds attribute is set."
 
-        self.xy(bounds[0], bounds[1], wait, resolution)
+        self.xy(bounds[0], bounds[1], angular_step, wait, resolution)
 
         for r in tqdm.tqdm(tqdm.trange(repeat), desc="Iteration", leave=False):
 
             if not reverse:
 
-                self.xy(bounds[2], bounds[1], wait, resolution, draw=True)
-                self.xy(bounds[2], bounds[3], wait, resolution, draw=True)
-                self.xy(bounds[0], bounds[3], wait, resolution, draw=True)
-                self.xy(bounds[0], bounds[1], wait, resolution, draw=True)
+                self.xy(bounds[2], bounds[1], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[2], bounds[3], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[0], bounds[3], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[0], bounds[1], angular_step, wait, resolution, draw=True)
 
             else:
 
-                self.xy(bounds[0], bounds[3], wait, resolution, draw=True)
-                self.xy(bounds[2], bounds[3], wait, resolution, draw=True)
-                self.xy(bounds[2], bounds[1], wait, resolution, draw=True)
-                self.xy(bounds[0], bounds[1], wait, resolution, draw=True)
+                self.xy(bounds[0], bounds[3], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[2], bounds[3], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[2], bounds[1], angular_step, wait, resolution, draw=True)
+                self.xy(bounds[0], bounds[1], angular_step, wait, resolution, draw=True)
 
         self.park()
 
     def test_pattern(
         self,
-        bounds=None,
         lines=4,
+        bounds=None,
+        angular_step=None,
         wait=None,
         resolution=None,
         repeat=1,
@@ -249,29 +267,14 @@ class Plotter:
         both=False,
     ):
 
-        self.vertical_lines(
-            bounds=bounds,
-            lines=lines,
-            wait=wait,
-            resolution=resolution,
-            repeat=repeat,
-            reverse=reverse,
-            both=both,
-        )
-        self.horizontal_lines(
-            bounds=bounds,
-            lines=lines,
-            wait=wait,
-            resolution=resolution,
-            repeat=repeat,
-            reverse=reverse,
-            both=both,
-        )
+        self.vertical_lines(lines, bounds, angular_step, wait, resolution, repeat, reverse, both)
+        self.horizontal_lines(lines, bounds, angular_step, wait, resolution, repeat, reverse, both)
 
     def vertical_lines(
         self,
-        bounds=None,
         lines=4,
+        bounds=None,
+        angular_step=None,
         wait=None,
         resolution=None,
         repeat=1,
@@ -295,17 +298,16 @@ class Plotter:
             step = (self.right - self.left) / lines
             x = self.left
             while x <= self.right:
-                self.draw_line(
-                    (x, top_y), (x, bottom_y), resolution=resolution, both=both
-                )
+                self.draw_line((x, top_y), (x, bottom_y), angular_step, wait, resolution, both)
                 x = x + step
 
         self.park()
 
     def horizontal_lines(
         self,
-        bounds=None,
         lines=4,
+        bounds=None,
+        angular_step=None,
         wait=None,
         resolution=None,
         repeat=1,
@@ -329,27 +331,29 @@ class Plotter:
             step = (self.bottom - self.top) / lines
             y = self.top
             while y >= self.bottom:
-                self.draw_line((min_x, y), (max_x, y), resolution=resolution, both=both)
+                self.draw_line((min_x, y), (max_x, y), angular_step, wait, resolution, both)
                 y = y + step
 
         self.park()
 
+    #  ----------------- x/y drawing methods -----------------
+
     def draw_line(
-        self, start=(0, 0), end=(0, 0), wait=None, resolution=None, both=False
+        self, start=(0, 0), end=(0, 0), angular_step=None, wait=None, resolution=None, both=False
     ):
         """Draws a line between two points"""
 
         start_x, start_y = start
         end_x, end_y = end
 
-        self.xy(x=start_x, y=start_y, wait=wait, resolution=resolution)
+        self.xy(start_x, start_y, angular_step, wait, resolution)
 
-        self.xy(x=end_x, y=end_y, wait=wait, resolution=resolution, draw=True)
+        self.xy(end_x, end_y, angular_step, wait, resolution, draw=True)
 
         if both:
-            self.xy(x=start_x, y=start_y, wait=wait, resolution=resolution, draw=True)
+            self.xy(start_x, start_y, angular_step, wait, resolution, draw=True)
 
-    def xy(self, x=None, y=None, wait=None, resolution=None, draw=False):
+    def xy(self, x=None, y=None, angular_step=None, wait=None, resolution=None, draw=False):
         """Moves the pen to the xy position; optionally draws while doing it. ``None`` for x or y
         means that the pen will not be moved in that dimension.
         """
@@ -357,59 +361,46 @@ class Plotter:
         wait = wait if wait is not None else self.wait
         resolution = resolution or self.resolution
 
-        if draw:
-            self.pen.down()
-        else:
-            self.pen.up()
-
         x = x if x is not None else self.x
         y = y if y is not None else self.y
-
         (angle_1, angle_2) = self.xy_to_angles(x, y)
 
-        # calculate how many steps we need for this move, and the x/y length of each
-        (x_length, y_length) = (x - self.x, y - self.y)
+        if draw:
 
-        length = math.sqrt(x_length**2 + y_length**2)
+            # calculate how many steps we need for this move, and the x/y length of each
+            (x_length, y_length) = (x - self.x, y - self.y)
 
-        no_of_steps = round(length / resolution) or 1
+            length = math.sqrt(x_length**2 + y_length**2)
 
-        if no_of_steps < 100:
-            disable_tqdm = True
+            no_of_steps = round(length / resolution) or 1
+
+            if no_of_steps < 100:
+                disable_tqdm = True
+            else:
+                disable_tqdm = False
+
+            (length_of_step_x, length_of_step_y) = (x_length / no_of_steps, y_length / no_of_steps)
+
+            for step in range(no_of_steps):
+
+                self.x = self.x + length_of_step_x
+                self.y = self.y + length_of_step_y
+
+                angle_1, angle_2 = self.xy_to_angles(self.x, self.y)
+                self.move_angles(angle_1, angle_2, angular_step, wait, draw)
+
         else:
-            disable_tqdm = False
-
-        (length_of_step_x, length_of_step_y) = (
-            x_length / no_of_steps,
-            y_length / no_of_steps,
-        )
-
-        for step in range(no_of_steps):
-
-            self.x = self.x + length_of_step_x
-            self.y = self.y + length_of_step_y
-
-            angle_1, angle_2 = self.xy_to_angles(self.x, self.y)
-
-            self.set_angles(angle_1, angle_2)
-
-            if step + 1 < no_of_steps:
-                sleep(length * wait / no_of_steps)
-
-        sleep(length * wait / 10)
+            self.move_angles(angle_1, angle_2, angular_step, wait, draw)
 
     #  ----------------- servo angle drawing methods -----------------
 
-    def move_angles(
-        self, angle_1=None, angle_2=None, wait=None, resolution=None, draw=False
-    ):
+    def move_angles(self, angle_1=None, angle_2=None, angular_step=None, wait=None, draw=False):
         """Moves the servo motors to the specified angles step-by-step, calling ``set_angles()`` for
-        each step. ``resolution`` refers to *degrees* of movement. ``None`` for one of the angles
-        means that that servo will not move.
+        each step. ``None`` for one of the angles means that that servo will not move.
         """
 
         wait = wait if wait is not None else self.wait
-        resolution = resolution or self.resolution
+        angular_step = angular_step or self.angular_step
 
         if draw:
             self.pen.down()
@@ -423,33 +414,29 @@ class Plotter:
         if angle_2 is not None:
             diff_2 = angle_2 - self.angle_2
 
-        length = math.sqrt(diff_1**2 + diff_2**2)
-
-        no_of_steps = int(length / resolution) or 1
+        no_of_steps = int(max(map(abs, (diff_1 / angular_step, diff_2 / angular_step)))) or 1
 
         if no_of_steps < 100:
             disable_tqdm = True
         else:
             disable_tqdm = False
 
-        (length_of_step_1, length_of_step_2) = (
-            diff_1 / no_of_steps,
-            diff_2 / no_of_steps,
-        )
+        (length_of_step_1, length_of_step_2) = (diff_1 / no_of_steps, diff_2 / no_of_steps)
 
         for step in tqdm.tqdm(
-            range(no_of_steps), desc="Interpolation", leave=False, disable=disable_tqdm
+            range(no_of_steps), desc="Progress", leave=False, disable=disable_tqdm
         ):
 
             self.angle_1 = self.angle_1 + length_of_step_1
             self.angle_2 = self.angle_2 + length_of_step_2
 
+            time_since_last_moved = monotonic() - self.last_moved
+            if time_since_last_moved < wait:
+                sleep(wait - time_since_last_moved)
+
             self.set_angles(self.angle_1, self.angle_2)
 
-            if step + 1 < no_of_steps:
-                sleep(length * wait / no_of_steps)
-
-        sleep(length * wait / 10)
+            self.last_moved = monotonic()
 
     # ----------------- pen-moving methods -----------------
 
@@ -517,15 +504,11 @@ class Plotter:
 
     def naive_angles_to_pulse_widths_1(self, angle):
         """A rule-of-thumb calculation of pulse-width for the desired servo angle"""
-        return (
-            angle - self.servo_1_parked_angle
-        ) * self.servo_1_degree_ms + self.servo_1_parked_pw
+        return (angle - self.servo_1_parked_angle) * self.servo_1_degree_ms + self.servo_1_parked_pw
 
     def naive_angles_to_pulse_widths_2(self, angle):
         """A rule-of-thumb calculation of pulse-width for the desired servo angle"""
-        return (
-            angle - self.servo_2_parked_angle
-        ) * self.servo_2_degree_ms + self.servo_2_parked_pw
+        return (angle - self.servo_2_parked_angle) * self.servo_2_degree_ms + self.servo_2_parked_pw
 
     # ----------------- line-processing methods -----------------
 
@@ -538,7 +521,7 @@ class Plotter:
             box_x_mid_point,
             box_y_mid_point,
             divider,
-        ) = self.analyse_lines(lines=lines, rotate=rotate, bounds=bounds)
+        ) = self.analyse_lines(lines, rotate, bounds)
 
         for line in lines:
 
@@ -547,17 +530,14 @@ class Plotter:
                     point[0], point[1] = point[1], point[0]
 
                 x = point[0]
-                x = (
-                    x - x_mid_point
-                )  # shift x values so that they have zero as their mid-point
+                x = x - x_mid_point  # shift x values so that they have zero as their mid-point
                 x = x / divider  # scale x values to fit in our box width
 
                 if flip ^ rotate:  # flip before moving back into drawing pane
                     x = -x
 
-                x = (
-                    x + box_x_mid_point
-                )  # shift x values so that they have the box x midpoint as their endpoint
+                # shift x values so that they have the box x midpoint as their endpoint
+                x = x + box_x_mid_point
 
                 y = point[1]
                 y = y - y_mid_point
@@ -631,9 +611,7 @@ class Plotter:
         # And their mid-points.
 
         x_mid_point, y_mid_point = (max_x + min_x) / 2, (max_y + min_y) / 2
-        box_x_mid_point, box_y_mid_point = (bounds[0] + bounds[2]) / 2, (
-            bounds[1] + bounds[3]
-        ) / 2
+        box_x_mid_point, box_y_mid_point = (bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2
 
         # Get a 'divider' value for each range - the value by which we must divide all x and y so
         # that they will fit safely inside the bounds.
@@ -654,14 +632,7 @@ class Plotter:
             rotate = True
             x_mid_point, y_mid_point = y_mid_point, x_mid_point
 
-        return (
-            rotate,
-            x_mid_point,
-            y_mid_point,
-            box_x_mid_point,
-            box_y_mid_point,
-            divider,
-        )
+        return (rotate, x_mid_point, y_mid_point, box_x_mid_point, box_y_mid_point, divider)
 
     # ----------------- physical control methods -----------------
 
@@ -674,13 +645,13 @@ class Plotter:
 
             if pw_1:
                 if 500 < pw_1 < 2500:
-                    self.virtual_pw_1 = pw_1
+                    self.virtual_pw_1 = int(pw_1)
                 else:
                     raise ValueError
 
             if pw_2:
                 if 500 < pw_2 < 2500:
-                    self.virtual_pw_2 = pw_2
+                    self.virtual_pw_2 = int(pw_2)
                 else:
                     raise ValueError
 
@@ -722,38 +693,102 @@ class Plotter:
 
     # ----------------- manual driving methods -----------------
 
-    def drive(self):
-        """Control the pulse-widths using the keyboard."""
+    def capture_pws(self):
+        """
+        Helps capture angle/pulse-width data for the servos, as a dictionary to be used
+        in a Plotter definition.
+        """
+
+        print(
+            """
+Drive each servo over a wide range of movement (do not exceed a pulse-width
+range ~600 to ~2400). To capture the pulse-width value for a particular angle,
+press "c", then enter the angle. For each angle, do this in both directions,
+clockwise and anti-clockwise. Press "0" to exit.
+        """
+        )
 
         pw_1, pw_2 = self.get_pulse_widths()
+        pen_pw = self.pen.get_pw()
 
-        self.set_pulse_widths(pw_1, pw_2)
+        last_action = values = None
+        pws1_dict = {}
+        pws2_dict = {}
+        pen_pw_dict = {}
+
+        print("0 to exit, c to capture a value, v to show captured values")
+        print("Shoulder a: -10  A: -1   s: +10  S: +1")
+        print("Elbow    k: -10  K: -1   l: +10  L: +1")
+        print("Pen      z: -10          x: +10")
+
+        controls = {
+            "a": [-10, 0, 0, "acw"],
+            "A": [-1, 0, 0, "acw"],
+            "s": [+10, 0, 0, "cw"],
+            "S": [+1, 0, 0, "cw"],
+            "k": [0, -10, 0, "acw"],
+            "K": [0, -1, 0, "acw"],
+            "l": [0, +10, 0, "cw"],
+            "L": [0, +1, 0, "cw"],
+            "z": [0, 0, -10],
+            "x": [0, 0, +10],
+        }
 
         while True:
+            # move the arms if commanded
             key = readchar.readchar()
+            values = controls.get(key)
 
-            if key == "0":
-                return
-            elif key == "a":
-                pw_1 = pw_1 - 10
-            elif key == "s":
-                pw_1 = pw_1 + 10
-            elif key == "A":
-                pw_1 = pw_1 - 2
-            elif key == "S":
-                pw_1 = pw_1 + 2
-            elif key == "k":
-                pw_2 = pw_2 - 10
-            elif key == "l":
-                pw_2 = pw_2 + 10
-            elif key == "K":
-                pw_2 = pw_2 - 2
-            elif key == "L":
-                pw_2 = pw_2 + 2
+            if values:
 
-            print(pw_1, pw_2)
+                if values[0] or values[1] or values[2]:
+                    previous_pw_1, previous_pw_2, previous_pen_pw = pw_1, pw_2, pen_pw
+                    pw_1 += values[0]
+                    pw_2 += values[1]
+                    pen_pw += values[2]
 
-            self.set_pulse_widths(pw_1, pw_2)
+                    print(f"shoulder: {pw_1}, elbow: {pw_2}, pen: {pen_pw}")
+
+                    self.set_pulse_widths(pw_1, pw_2)
+                    self.pen.pw(pen_pw)
+
+                    last_action = values
+
+            elif key == "0" or key == "v":
+                # exit and print results
+                print("servo_1_angle_pws_bidi =")
+                pprint.pp(pws1_dict, sort_dicts=True, indent=4)
+                print("servo_2_angle_pws_bidi =")
+                pprint.pp(pws2_dict, sort_dicts=True, indent=4)
+                print("Pen pulse-widths =")
+                pprint.pp(pen_pw_dict)
+
+                if key == "0":
+                    return
+
+            elif key == "c":
+                # capture a value
+                if not last_action:
+                    print("Drive the servos to a new position first")
+
+                # add the values - if any - to the dictionaries
+                elif last_action[0]:
+                    angle = int(input("Enter the angle of the inner arm: "))
+                    pws1_dict.setdefault(angle, {})[last_action[3]] = pw_1
+
+                    print(pws1_dict)
+
+                elif last_action[1]:
+                    angle = int(input("Enter the angle of the outer arm: "))
+                    pws2_dict.setdefault(angle, {})[last_action[3]] = pw_2
+
+                    print(pws2_dict)
+
+                elif last_action[2]:
+                    state = input("Enter the state of the pen ([u]p, [d]own):")
+                    pen_pw_dict[state] = pen_pw
+
+                    print(pen_pw)
 
     def drive_xy(self):
         """Control the x/y position using the keyboard."""
@@ -809,16 +844,13 @@ class Plotter:
         print("pen:", self.pen.position)
 
         print("------------------------------------------")
-        print(
-            "left:",
-            self.left,
-            "right:",
-            self.right,
-            "top:",
-            self.top,
-            "bottom:",
-            self.bottom,
-        )
+        print(f"left: {self.left}, right: {self.right}, top: {self.top}, bottom: {self.bottom}")
+        print("------------------------------------------")
+        print(f"wait: {self.wait} seconds")
+        print("------------------------------------------")
+        print(f"resolution: {self.resolution} cm")
+        print("------------------------------------------")
+        print(f"angular step: {self.angular_step}˚")
         print("------------------------------------------")
 
     @property
@@ -861,15 +893,14 @@ class Plotter:
 
 
 class Pen:
-    def __init__(
-        self, bg, pw_up=1700, pw_down=1300, pin=18, transition_time=0.25, virtual=False
-    ):
+    def __init__(self, bg, pw_up=1700, pw_down=1300, pin=18, transition_time=0.25, virtual=False):
 
         self.bg = bg
         self.pin = pin
         self.pw_up = pw_up
         self.pw_down = pw_down
         self.transition_time = transition_time
+        self.position = "down"
         self.virtual = virtual
         if self.virtual:
 
@@ -881,41 +912,53 @@ class Pen:
             self.rpi.set_PWM_frequency(self.pin, 50)
 
         self.up()
-        sleep(0.3)
-        self.down()
-        sleep(0.3)
-        self.up()
-        sleep(0.3)
 
     def down(self):
 
-        if self.virtual:
-            self.virtual_pw = self.pw_down
+        if self.position == "up":
 
-        else:
-            self.rpi.set_servo_pulsewidth(self.pin, self.pw_down)
-            sleep(self.transition_time)
+            if self.virtual:
+                self.virtual_pw = self.pw_down
 
-        if self.bg.turtle:
-            self.bg.turtle.down()
-            self.bg.turtle.color("blue")
-            self.bg.turtle.width(1)
+            else:
+                self.ease_pen(self.pw_up, self.pw_down)
+                # self.rpi.set_servo_pulsewidth(self.pin, self.pw_down)
 
-        self.position = "down"
+            if self.bg.turtle:
+                self.bg.turtle.down()
+                self.bg.turtle.color("blue")
+                self.bg.turtle.width(1)
+
+            self.position = "down"
 
     def up(self):
 
-        if self.virtual:
-            self.virtual_pw = self.pw_up
+        if self.position == "down":
 
-        else:
-            self.rpi.set_servo_pulsewidth(self.pin, self.pw_up)
-            sleep(self.transition_time)
+            if self.virtual:
+                self.virtual_pw = self.pw_up
 
-        if self.bg.turtle:
-            self.bg.turtle.up()
+            else:
+                self.ease_pen(self.pw_down, self.pw_up)
+                # self.rpi.set_servo_pulsewidth(self.pin, self.pw_up)
 
-        self.position = "up"
+            if self.bg.turtle:
+                self.bg.turtle.up()
+
+            self.position = "up"
+
+    def ease_pen(self, start, end):
+        """
+        Moves the pen gently instead of all at once. Slower but reduces marking on the paper.
+        """
+        diff = end - start
+        angle = start
+        length_of_step = diff / abs(diff)
+
+        for i in range(abs(diff)):
+            angle += length_of_step
+            self.rpi.set_servo_pulsewidth(self.pin, angle)
+            sleep(0.001)
 
     # for convenience, a quick way to set pen motor pulse-widths
     def pw(self, pulse_width):
@@ -925,3 +968,12 @@ class Pen:
 
         else:
             self.rpi.set_servo_pulsewidth(self.pin, pulse_width)
+
+    # for convenience, a quick way to get pen motor pulse-widths
+    def get_pw(self):
+
+        if self.virtual:
+            return self.virtual_pw
+
+        else:
+            return self.rpi.get_servo_pulsewidth(self.pin)
